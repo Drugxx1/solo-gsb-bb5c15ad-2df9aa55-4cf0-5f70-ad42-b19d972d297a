@@ -4,6 +4,7 @@ Endpoints
 ---------
 POST   /api/analyze                          analyze a rule set (optionally persist)
 POST   /api/analyses/{id}/simulate           preview add/replace/remove changes without saving
+POST   /api/analyses/{id}/merge-precheck     precheck merging two change batches on one base version
 GET    /api/analyses                         list saved analysis versions
 GET    /api/analyses/{id}                    fetch one version with the full result
 GET    /api/analyses/{id}/rules              query rules (filters: status/action/ip_version)
@@ -32,8 +33,9 @@ from . import db
 from .change_guard import ChangeGuardError, guard_changes, parse_guard_entries
 from .decision_map import DecisionMapError, build_decision_map, parse_query_cidr
 from .diff import ANALYSIS_ID_RE, diff_analyses
+from .merge_precheck import build_batch, merge_precheck
 from .redundant import redundant_rule_inventory
-from .schemas import AnalyzeRequest, ChangeGuardRequest, SimulateRequest
+from .schemas import AnalyzeRequest, ChangeGuardRequest, MergePrecheckRequest, SimulateRequest
 from .simulate import PatchError, apply_patch, rebuild_input_rules
 
 
@@ -183,6 +185,47 @@ def simulate_changes(analysis_id: str, req: SimulateRequest) -> dict[str, Any]:
         "simulated": simulated,
         "diff": diff,
     }
+
+
+@app.post("/api/analyses/{analysis_id}/merge-precheck", status_code=200)
+def merge_precheck_changes(analysis_id: str, req: MergePrecheckRequest) -> dict[str, Any]:
+    """Precheck merging two batches of rule changes on one saved version.
+
+    Batches ``a`` and ``b`` each carry the ordinary add/replace/remove
+    operations of a simulation batch.  Both are replayed independently from
+    the rebuilt base input and re-analyzed; a ``rule_id`` targeted by both
+    batches is a *structural conflict*.  The address ranges each side changes
+    relative to the base are overlaid per IPv4/IPv6 family, and intersections
+    whose final action differs come back as minimal-CIDR *action conflicts*
+    carrying the base and both sides' actions.  Otherwise batch A is applied
+    first and B on top, the merge is re-analyzed, and any range a side had
+    changed but the merge does not keep at that side's action is reported as a
+    *merge conflict*; a clean response carries the full merged analysis plus
+    its diff against the base.  Nothing is persisted: no analysis version is
+    created and the base version is never modified.
+    """
+    base = db.get_analysis(analysis_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+
+    def _build_batch(batch: SimulateRequest):
+        return build_batch(
+            add=[r.model_dump() for r in batch.add],
+            replace=[r.model_dump() for r in batch.replace],
+            remove=[r.model_dump() for r in batch.remove],
+        )
+
+    result = merge_precheck(base, _build_batch(req.a), _build_batch(req.b))
+
+    merged = result["merged"]
+    if merged is not None:
+        # Present the merged candidate exactly like a simulated (unsaved)
+        # analysis: it has no identity of its own and is never persisted.
+        merged["id"] = None
+        merged["name"] = None
+        merged["created_at"] = db.utc_now_iso()
+        merged["persisted"] = False
+    return result
 
 
 @app.get("/api/analyses/{analysis_id}/rules")

@@ -97,6 +97,28 @@ class SimulateRequest(BaseModel):
         return v
 
 
+class ChangeBatch(SimulateRequest):
+    """One side (``a`` or ``b``) of a two-batch merge precheck.
+
+    Same add/replace/remove contract as a single-batch simulation, evaluated
+    independently against the common base version: at least one operation and
+    the normal all-or-nothing patch validation.
+    """
+
+
+class MergePrecheckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    a: ChangeBatch = Field(
+        ...,
+        description="First change batch (applied first when composing the merge)",
+    )
+    b: ChangeBatch = Field(
+        ...,
+        description="Second change batch (applied on top of batch A)",
+    )
+
+
 class GuardEntryIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

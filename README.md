@@ -94,6 +94,7 @@ N 的实际覆盖碎片。
 | --- | --- | --- |
 | POST | `/api/analyze` | 分析规则集（默认保存；`save:false` 只算不存） |
 | POST | `/api/analyses/{id}/simulate` | 基于已保存版本预演 add/replace/remove 规则变更（**不落库**），返回新分析结果与语义差异 |
+| POST | `/api/analyses/{id}/merge-precheck` | **双批次变更合并预检**：A、B 两组 add/replace/remove 基于同一基线分别重算，检测结构冲突/地址动作冲突/合并冲突（**不落库**），无冲突时返回合并分析与相对基线差异 |
 | GET | `/api/analyses` | 列出已保存版本（`limit`/`offset` 分页） |
 | GET | `/api/analyses/{id}` | 取某个版本的完整分析结果 |
 | GET | `/api/analyses/{id}/rules` | 查询规则：`status=active/partial/shadowed`、`action=permit/deny`、`ip=4/6` |
@@ -272,6 +273,130 @@ curl -s -X POST http://localhost:8080/api/analyses/an_e38b58f57faf2325/simulate 
 
 基准版本不存在 → `404`。预演不产生任何副作用，可安全重复调用；若补丁与基准完全等价
 （如用相同记录 replace），`diff.changes` 为空且 `ruleset_hash` 与基准一致。
+
+### 双批次变更合并预检（merge precheck）
+
+`POST /api/analyses/{id}/merge-precheck` 审查两组**各自独立、都基于同一已保存基线**的
+add/replace/remove 变更（请求体里的 `a`、`b`，结构同 simulate 批次）能否一起落地。服务端
+**重建基线输入后分别重算两侧的最终生效动作**，全部为纯网段几何运算（IPv4/IPv6 各自独立、
+不枚举地址），**不新建分析版本、不写库、不修改基线**。按顺序给出四类结论：
+
+1. **结构冲突 `structural_conflicts`**：同一 `rule_id` 同时成为 A、B 两批操作的目标
+   （两侧都 remove 也算）——两边都要在同一条基线上决定这条规则的命运，无法直接合并；
+   每条冲突给出 `rule_id` 与 `side_a_operation` / `side_b_operation`。
+2. **地址动作冲突 `action_conflicts`**：取**两侧各自相对基线发生动作改变的地址范围**，
+   按 IPv4/IPv6 精确叠加；在两侧都改过、但**最终动作不同**的交集上产生冲突，输出
+   **最小 CIDR**（相邻同前缀兄弟块会合并）及 `base_action`（基线动作，无规则命中为 `null`）、
+   `side_a_action`、`side_b_action` 与精确地址数。两侧改成**相同动作**的交集不算冲突；
+   只有一侧改变的范围也不算。
+3. **合并冲突 `merge_conflicts`**：在没有前两类冲突时，**先应用 A、再在 A 的结果上应用 B**
+   （A 的 add 排在 B 的 add 之前，同 CIDR 裁决据此定序），对合并规则集**重新执行 LPM 分析**；
+   然后逐地址核对两侧相对基线改变过的范围——若合并结果在某侧改过的范围上**没有保持该侧的
+   最终动作**，就产生冲突，给出 `side`（`"a"`/`"b"`）、`base_action`、该侧 `side_action`、
+   `merged_action` 与最小 CIDR。它能发现直接叠加看不出来的交互：例如基线是
+   `deny /8 → permit /16`，A 把 /16 改成 deny（/16 permit→deny），B 在其中加一条
+   permit /24（相对基线是 no-op，基线 /16 本就 permit）——直接叠加两侧改变范围无交集，
+   但 A 后 B 的合并结果里更长的 permit /24 胜出，把 A 在 /24 上的 deny 改回了 permit。
+4. **全部通过**：`passed: true`，返回 `merged`（合并后的**完整分析结果**，`id: null`、
+   `persisted: false`）与 `diff`（合并结果相对**基线**的最终生效动作语义差异，结构同
+   版本语义差异端点）。
+
+存在结构冲突或地址动作冲突时，依赖该阶段的后续结果置为 `null`（`merged`/`diff`/
+`merge_conflicts`）。批次契约与 simulate 完全一致——每批至少一个操作、每批独立相对基线
+校验（add 必须是基线中不存在的新 ID，replace/remove 必须命中基线，每个目标每批最多一次，
+单批不能删光规则）。两批**合起来**删光所有规则是合法合并（合并结果所有地址为 `none`，
+照常返回差异）。
+
+```bash
+curl -s -X POST http://localhost:8080/api/analyses/an_e38b58f57faf2325/merge-precheck \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "add": [{"rule_id": "a9", "cidr": "10.20.0.0/16", "action": "deny"}]
+    },
+    "b": {
+      "remove": [{"rule_id": "r2"}],
+      "add": [{"rule_id": "b9", "cidr": "10.30.0.0/16", "action": "permit"}]
+    }
+  }'
+```
+
+无冲突响应（节选）：
+
+```json
+{
+  "base": {"id": "an_e38b58f57faf2325", "ruleset_hash": "e38b58f5...", "analyzer_version": "1.0.0"},
+  "sides": {
+    "a": {"ruleset_hash": "1f2a...", "rule_count": 5},
+    "b": {"ruleset_hash": "9d7c...", "rule_count": 5}
+  },
+  "passed": true,
+  "structural_conflicts": [],
+  "action_conflicts": [],
+  "merge_conflicts": [],
+  "merged": {
+    "analyzer_version": "1.0.0",
+    "ruleset_hash": "c11e...（合并输入的哈希，仅用于本次响应）",
+    "id": null, "name": null, "persisted": false,
+    "summary": {"rule_count": 5, "...": "..."},
+    "rules": ["...完整规则结果..."],
+    "findings": ["..."],
+    "minimal_conflict_pairs": ["..."]
+  },
+  "diff": {
+    "base":   {"id": "an_e38b58f57faf2325", "ruleset_hash": "e38b58f5...", "analyzer_version": "1.0.0"},
+    "target": {"id": null, "ruleset_hash": "c11e...", "analyzer_version": "1.0.0"},
+    "changes": ["...合并结果相对基线的最小 CIDR 动作差异..."],
+    "summary": {"...": "与版本语义差异相同的分类计数..."}
+  },
+  "summary": {
+    "structural_conflicts": 0,
+    "action_conflict_ranges": 0,
+    "action_conflict_addresses": 0,
+    "merge_conflict_ranges": 0,
+    "merge_conflict_addresses": 0
+  }
+}
+```
+
+地址动作冲突示例响应（基线 `permit 10.0.0.0/8`；A 删掉该规则、B 加 `deny 10.1.0.0/16`，
+交集 /16 上 A 为 `null`(none)、B 为 deny）：
+
+```json
+{
+  "passed": false,
+  "structural_conflicts": [],
+  "action_conflicts": [
+    {
+      "ip_version": 4,
+      "base_action": "permit",
+      "side_a_action": null,
+      "side_b_action": "deny",
+      "address_count": 65536,
+      "range_count": 1,
+      "cidrs": ["10.1.0.0/16"]
+    }
+  ],
+  "merge_conflicts": null,
+  "merged": null,
+  "diff": null,
+  "summary": {
+    "structural_conflicts": 0,
+    "action_conflict_ranges": 1,
+    "action_conflict_addresses": 65536,
+    "merge_conflict_ranges": null,
+    "merge_conflict_addresses": null
+  }
+}
+```
+
+错误码（与 simulate 一致，复用同一套规则校验与异常格式）：
+
+- 任一批次非法（未知/重复目标、add 撞基线 ID、单批删光、空批次等）→ `400`
+  `invalid_simulation`，`issues` 一次性列出全部问题（A 先于 B 校验）；
+- 批次内新增/替换规则 CIDR、action 非法 → `400 invalid_ruleset`；
+- 字段层面错误（缺 `a`/`b`、未知顶层字段、操作对象多余字段、未知 action 等）→ `422`；
+- 基准版本不存在 → `404`。
 
 ### 已保存版本的 CIDR 决策地图（decision map）
 
@@ -531,9 +656,11 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
 
 - 非法 CIDR（语法错误、主机位非零、rule_id 重复等）→ `400`，形如
   `{"error": "invalid_ruleset", "detail": "rule #1: invalid CIDR '10.0.0.5/24' (...)"}`
-- 预演批次非法（add 撞已有 ID、replace/remove 未命中基准、同一目标出现多次、删光所有规则、
-  空批次）→ `400`，形如
+- 预演/合并预检批次非法（add 撞已有 ID、replace/remove 未命中基准、同一目标在单批内出现
+  多次、单批删光所有规则、空批次等）→ `400`，形如
   `{"error": "invalid_simulation", "detail": "...", "issues": ["...全部问题..."]}`
+  （合并预检中同一 `rule_id` 被 A、B 两批同时操作属于**语义冲突**，返回 `200` 且
+  `passed: false`，不是 400）
 - 决策地图 CIDR 查询非法（主机位非零、缺前缀长度等）→ `400`，形如
   `{"error": "invalid_cidr", "detail": "invalid CIDR '10.0.0.5/24' (...)"}`
 - 变更守卫授权集非法（授权 CIDR 非严格 CIDR、异类授权相互重叠等）→ `400`，形如
@@ -555,6 +682,7 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
 │   ├── decision_map.py  # 已保存版本的 CIDR 决策地图：查询网段切分 + 匹配链（纯函数，可独立使用）
 │   ├── redundant.py     # 冗余规则盘点：逐条移除 + 重算 LPM + 语义差异比较（纯函数，可独立使用）
 │   ├── simulate.py      # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
+│   ├── merge_precheck.py # 双批次合并预检：两侧分别重算 + 改变范围精确叠加 + A 后 B 合并重算（纯函数）
 │   ├── schemas.py       # Pydantic v2 请求/响应模型
 │   ├── db.py            # SQLite 持久层（analyses / rules / findings 三表）
 │   └── main.py          # FastAPI 路由
@@ -564,6 +692,7 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
 ├── tests/test_decision_map.py  # CIDR 决策地图端点测试
 ├── tests/test_redundant_rules.py # 冗余规则盘点端点测试
 ├── tests/test_simulate.py      # 规则变更预演端点测试
+├── tests/test_merge_precheck.py # 双批次合并预检端点测试
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
 ├── docker-compose.yml  # 单命令启动 + 命名卷持久化
