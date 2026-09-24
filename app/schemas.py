@@ -97,6 +97,22 @@ class SimulateRequest(BaseModel):
         return v
 
 
+class MergePrecheckRequest(BaseModel):
+    """Two independent add/replace/remove batches prechecked for merging.
+
+    Both batches are replayed from the same saved base version; A is applied
+    before B in the tentative merge.  Each batch obeys the single-batch
+    :class:`SimulateRequest` contract on its own (at least one operation,
+    each rule_id targeted at most once, add introduces new ids,
+    replace/remove hit the base).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    side_a: SimulateRequest = Field(..., alias="a", description="Batch A operations (applied first)")
+    side_b: SimulateRequest = Field(..., alias="b", description="Batch B operations (applied second)")
+
+
 class GuardEntryIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

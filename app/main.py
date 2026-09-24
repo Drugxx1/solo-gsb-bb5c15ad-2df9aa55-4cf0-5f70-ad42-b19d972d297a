@@ -4,6 +4,7 @@ Endpoints
 ---------
 POST   /api/analyze                          analyze a rule set (optionally persist)
 POST   /api/analyses/{id}/simulate           preview add/replace/remove changes without saving
+POST   /api/analyses/{id}/merge-precheck     precheck merging two independent A/B change batches
 GET    /api/analyses                         list saved analysis versions
 GET    /api/analyses/{id}                    fetch one version with the full result
 GET    /api/analyses/{id}/rules              query rules (filters: status/action/ip_version)
@@ -32,8 +33,14 @@ from . import db
 from .change_guard import ChangeGuardError, guard_changes, parse_guard_entries
 from .decision_map import DecisionMapError, build_decision_map, parse_query_cidr
 from .diff import ANALYSIS_ID_RE, diff_analyses
+from .merge_precheck import merge_precheck
 from .redundant import redundant_rule_inventory
-from .schemas import AnalyzeRequest, ChangeGuardRequest, SimulateRequest
+from .schemas import (
+    AnalyzeRequest,
+    ChangeGuardRequest,
+    MergePrecheckRequest,
+    SimulateRequest,
+)
 from .simulate import PatchError, apply_patch, rebuild_input_rules
 
 
@@ -183,6 +190,52 @@ def simulate_changes(analysis_id: str, req: SimulateRequest) -> dict[str, Any]:
         "simulated": simulated,
         "diff": diff,
     }
+
+
+def _batch_ops(batch: SimulateRequest) -> dict[str, list[dict[str, Any]]]:
+    return {
+        "add": [r.model_dump() for r in batch.add],
+        "replace": [r.model_dump() for r in batch.replace],
+        "remove": [r.model_dump() for r in batch.remove],
+    }
+
+
+@app.post("/api/analyses/{analysis_id}/merge-precheck", status_code=200)
+def merge_precheck_changes(analysis_id: str, req: MergePrecheckRequest) -> dict[str, Any]:
+    """Precheck merging two independent A/B batches of rule changes.
+
+    Each batch is replayed from the same saved base via the same validated
+    add/replace/remove machinery as ``/simulate``.  A ``rule_id`` operated on
+    by **both** batches is a structural conflict; otherwise the batches are
+    merged (A then B) and the analysis is recomputed.  Address ranges changed
+    relative to the base on both sides are overlaid per IP family: ranges
+    whose actions differ are returned as minimal CIDRs with the base and both
+    side actions, and ranges the merged result fails to keep at the changing
+    side's action are reported as preservation conflicts.  Nothing is
+    persisted; the compatible response carries the merged analysis and its
+    diff against the base.
+    """
+    base = db.get_analysis(analysis_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+
+    ops_a = _batch_ops(req.side_a)
+    ops_b = _batch_ops(req.side_b)
+
+    # Batch-level problems (either side, or the merged result) surface as the
+    # same 400 invalid_simulation error, tagged with the offending side;
+    # invalid CIDRs/actions still surface as 400 invalid_ruleset.
+    report = merge_precheck(base, ops_a, ops_b)
+
+    # The structural-conflict report carries no merged analysis; every other
+    # report's merged preview mirrors the simulate endpoint's unsaved shape.
+    merged = report["merged"]
+    if merged is not None:
+        merged["id"] = None
+        merged["name"] = None
+        merged["created_at"] = db.utc_now_iso()
+        merged["persisted"] = False
+    return report
 
 
 @app.get("/api/analyses/{analysis_id}/rules")
